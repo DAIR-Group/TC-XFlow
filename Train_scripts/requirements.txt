@@ -1,0 +1,8 @@
+torch>=2.0
+numpy
+scipy
+matplotlib
+pandas
+cartopy
+opencv-python
+netCDF4
