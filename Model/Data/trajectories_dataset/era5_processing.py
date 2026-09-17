@@ -131,7 +131,6 @@ def load_era5_file(path: str) -> np.ndarray | None:
         logger.debug(f"ERA5 file load error {path}: {e}")
         return None
 
-
 def read_era5_step(era5_data_path: str, year, ty_name, timestamp) -> torch.Tensor:
     folder = os.path.join(era5_data_path, str(year), str(ty_name))
     if not os.path.exists(folder):
