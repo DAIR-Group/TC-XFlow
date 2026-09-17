@@ -9,91 +9,104 @@ import torch.nn.functional as F
 
 class SpectralConv3d(nn.Module):
 
+
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        modes_t: int = 4,
-        modes_h: int = 4,
-        modes_w: int = 4,
+        modes_time: int = 4,
+        modes_lat: int = 4,
+        modes_lon: int = 4,
     ):
         super().__init__()
-        self.in_ch = in_channels
-        self.out_ch = out_channels
-        self.modes_t = modes_t
-        self.modes_h = modes_h
-        self.modes_w = modes_w
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes_time = modes_time
+        self.modes_lat = modes_lat
+        self.modes_lon = modes_lon
 
-        _scale = 1.0 / math.sqrt(in_channels * out_channels)
-        _shape = (in_channels, out_channels, modes_t, modes_h, modes_w)
+        scale = 1.0 / math.sqrt(in_channels * out_channels)
+        weight_shape = (in_channels, out_channels, modes_time, modes_lat, modes_lon)
 
-        for i in range(1, 5):
-            setattr(self, f"w_re_{i}", nn.Parameter(_scale * torch.randn(*_shape)))
-            setattr(self, f"w_im_{i}", nn.Parameter(_scale * torch.randn(*_shape)))
+       
+        for quadrant in range(1, 5):
+            setattr(self, f"weight_real_{quadrant}", nn.Parameter(scale * torch.randn(*weight_shape)))
+            setattr(self, f"weight_imag_{quadrant}", nn.Parameter(scale * torch.randn(*weight_shape)))
 
-    def _complex_mul(self, x, w_re, w_im):
-        w_re = w_re.float()
-        w_im = w_im.float()
-        x_re = x.real.float()
-        x_im = x.imag.float()
-        out_re = torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_re) - torch.einsum(
-            "bipqr,ijpqr->bjpqr", x_im, w_im
+    def _complex_multiply(self, x: torch.Tensor, weight_real: torch.Tensor, weight_imag: torch.Tensor):
+        weight_real = weight_real.float()
+        weight_imag = weight_imag.float()
+        x_real = x.real.float()
+        x_imag = x.imag.float()
+        out_real = torch.einsum("bipqr,ijpqr->bjpqr", x_real, weight_real) - torch.einsum(
+            "bipqr,ijpqr->bjpqr", x_imag, weight_imag
         )
-        out_im = torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_im) + torch.einsum(
-            "bipqr,ijpqr->bjpqr", x_im, w_re
+        out_imag = torch.einsum("bipqr,ijpqr->bjpqr", x_real, weight_imag) + torch.einsum(
+            "bipqr,ijpqr->bjpqr", x_imag, weight_real
         )
-        return torch.complex(out_re, out_im)
+        return torch.complex(out_real, out_imag)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
-        x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
+        batch_size, _, n_time, n_lat, n_lon = x.shape
+        x_freq = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
 
-        out_ft = torch.zeros(B, self.out_ch, T, H, W // 2 + 1, dtype=torch.cfloat, device=x.device)
-
-        mt = min(self.modes_t, T // 2)
-        mh = min(self.modes_h, H // 2)
-        mw = min(self.modes_w, W // 2 + 1)
-
-        out_ft[:, :, :mt, :mh, :mw] = self._complex_mul(
-            x_ft[:, :, :mt, :mh, :mw], self.w_re_1, self.w_im_1
+        out_freq = torch.zeros(
+            batch_size, self.out_channels, n_time, n_lat, n_lon // 2 + 1,
+            dtype=torch.cfloat, device=x.device,
         )
 
-        out_ft[:, :, -mt:, :mh, :mw] = self._complex_mul(
-            x_ft[:, :, -mt:, :mh, :mw], self.w_re_2, self.w_im_2
+        mt = min(self.modes_time, n_time // 2)
+        ml = min(self.modes_lat, n_lat // 2)
+        mo = min(self.modes_lon, n_lon // 2 + 1)
+
+    
+        out_freq[:, :, :mt, :ml, :mo] = self._complex_multiply(
+            x_freq[:, :, :mt, :ml, :mo], self.weight_real_1, self.weight_imag_1
+        )
+   
+        out_freq[:, :, -mt:, :ml, :mo] = self._complex_multiply(
+            x_freq[:, :, -mt:, :ml, :mo], self.weight_real_2, self.weight_imag_2
+        )
+  
+        out_freq[:, :, :mt, -ml:, :mo] = self._complex_multiply(
+            x_freq[:, :, :mt, -ml:, :mo], self.weight_real_3, self.weight_imag_3
+        )
+  
+        out_freq[:, :, -mt:, -ml:, :mo] = self._complex_multiply(
+            x_freq[:, :, -mt:, -ml:, :mo], self.weight_real_4, self.weight_imag_4
         )
 
-        out_ft[:, :, :mt, -mh:, :mw] = self._complex_mul(
-            x_ft[:, :, :mt, -mh:, :mw], self.w_re_3, self.w_im_3
+        return torch.fft.irfftn(out_freq, s=(n_time, n_lat, n_lon), dim=(-3, -2, -1), norm="ortho").to(
+            x.dtype
         )
-
-        out_ft[:, :, -mt:, -mh:, :mw] = self._complex_mul(
-            x_ft[:, :, -mt:, -mh:, :mw], self.w_re_4, self.w_im_4
-        )
-
-        return torch.fft.irfftn(out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho").to(x.dtype)
 
 
 class FNOLayer3d(nn.Module):
+
+
     def __init__(
         self,
         channels: int,
-        modes_t: int = 4,
-        modes_h: int = 4,
-        modes_w: int = 4,
+        modes_time: int = 4,
+        modes_lat: int = 4,
+        modes_lon: int = 4,
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.spectral = SpectralConv3d(channels, channels, modes_t, modes_h, modes_w)
-        self.local = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.spectral_conv = SpectralConv3d(channels, channels, modes_time, modes_lat, modes_lon)
+        self.pointwise_residual = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
         self.norm = nn.InstanceNorm3d(channels, affine=True)
-        self.act = nn.GELU()
+        self.activation = nn.GELU()
         self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.act(self.norm(self.spectral(x) + self.local(x))))
+        return self.drop(
+            self.activation(self.norm(self.spectral_conv(x) + self.pointwise_residual(x)))
+        )
 
 
 class FNO3DEncoder(nn.Module):
+
 
     def __init__(
         self,
@@ -122,38 +135,39 @@ class FNO3DEncoder(nn.Module):
             [FNOLayer3d(d_model, modes_t, modes_h, modes_w, dropout) for _ in range(n_layers)]
         )
 
-        self.proj_bottleneck = nn.Conv3d(d_model, 128, kernel_size=1, bias=False)
+        self.bottleneck_proj = nn.Conv3d(d_model, 128, kernel_size=1, bias=False)
 
-        self.summary_conv = nn.Sequential(
+        self.summary_head = nn.Sequential(
             nn.Conv3d(d_model, 16, kernel_size=1, bias=False),
             nn.GELU(),
             nn.Conv3d(16, out_channel, kernel_size=1, bias=False),
             nn.AdaptiveAvgPool3d((None, 1, 1)),
         )
 
-        self.inc = _ChannelProxy(in_channel)
-
     def _downsample_spatial(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
-        if H == self.spatial_down and W == self.spatial_down:
+        batch_size, n_channels, n_time, n_lat, n_lon = x.shape
+        if n_lat == self.spatial_down and n_lon == self.spatial_down:
             return x
-        x2 = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-        x2 = F.interpolate(
-            x2, size=(self.spatial_down, self.spatial_down), mode="bilinear", align_corners=False
+        x_flat_time = x.permute(0, 2, 1, 3, 4).reshape(batch_size * n_time, n_channels, n_lat, n_lon)
+        x_flat_time = F.interpolate(
+            x_flat_time, size=(self.spatial_down, self.spatial_down), mode="bilinear", align_corners=False
         )
-        return x2.reshape(B, T, C, self.spatial_down, self.spatial_down).permute(0, 2, 1, 3, 4)
+        return x_flat_time.reshape(
+            batch_size, n_time, n_channels, self.spatial_down, self.spatial_down
+        ).permute(0, 2, 1, 3, 4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, summary = self.encode(x)
         return summary
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
         if x.dim() == 4:
             x = x.unsqueeze(1)
 
-        B, C, T, H, W = x.shape
+        _, n_channels, _, _, _ = x.shape
 
-        if C == 1 and self.in_channel != 1:
+        if n_channels == 1 and self.in_channel != 1:
             x = x.expand(-1, self.in_channel, -1, -1, -1)
 
         x = self._downsample_spatial(x)
@@ -162,19 +176,9 @@ class FNO3DEncoder(nn.Module):
         for layer in self.fno_layers:
             x = layer(x)
 
-        bot = self.proj_bottleneck(x)
-        bot = F.adaptive_avg_pool3d(bot, (None, 4, 4))
+        bottleneck = self.bottleneck_proj(x)
+        bottleneck = F.adaptive_avg_pool3d(bottleneck, (None, 4, 4))
 
-        summary = self.summary_conv(x)
+        summary = self.summary_head(x)
 
-        return bot, summary
-
-
-class _ChannelProxy:
-    class _skip:
-        def __init__(self, c):
-            self.in_channels = c
-
-    def __init__(self, c):
-        self.skip = _ChannelProxy._skip(c)
-
+        return bottleneck, summary
