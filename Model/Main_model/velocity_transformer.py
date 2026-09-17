@@ -1,17 +1,3 @@
-"""
-VelocityTransformer: v_theta(z_tau, tau, c) trong OT-CFM (Section 4.3).
-Non-autoregressive Transformer decoder - tất cả pred_len horizon query
-được xử lý đồng thời, attend chung vào 1 memory chứa flow-time embedding
-và context vector c.
-
-FiLM conditioning theo từng horizon (film_gamma/film_beta) cho phép mỗi
-query horizon áp affine transform riêng lên context, thay vì dùng chung
-1 cách "chú ý" tới c cho mọi horizon.
-
-out_proj khởi tạo zero + out_scale sigmoid(init~0.1) => velocity dự đoán
-ban đầu gần 0, tránh bước cập nhật đầu tiên quá lớn làm hỏng gradient.
-"""
-
 from __future__ import annotations
 
 import math
@@ -67,8 +53,6 @@ class VelocityTransformer(nn.Module):
         nn.init.zeros_(self.out_proj[-1].bias)
 
     def _time_emb(self, t: torch.Tensor) -> torch.Tensor:
-        """Sinusoidal embedding cho flow-time tau, giống chuẩn Transformer
-        positional encoding nhưng dùng cho biến continuous [0,1]."""
         half = self.d_model // 2
         freq = torch.exp(
             torch.arange(half, device=t.device, dtype=t.dtype)
@@ -81,11 +65,7 @@ class VelocityTransformer(nn.Module):
         return self.time_mlp(emb)
 
     def _decode_with_attn(self, x_emb: torch.Tensor, memory: torch.Tensor):
-        """Chạy lại thủ công từng layer của self.decoder để lấy được
-        cross-attention weight (average_attn_weights=True) — dùng cho
-        phân tích XAI (Section 4.8), không dùng trong forward pass
-        bình thường vì tốn thêm 1 chút overhead so với nn.TransformerDecoder
-        có sẵn."""
+     
         x = x_emb
         attn_per_layer = []
         for layer in self.decoder.layers:
