@@ -1,28 +1,56 @@
+
 from __future__ import annotations
 
 import math
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from Model.Encoder.FNO3D_encoder import FNO3DEncoder
-from Model.Encoder.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
+from Model.Encoder.mamba_encoder import BestTrackMambaEncoder
 from Model.Encoder.env_net import Env_net
 from Model.Main_model.loss import _norm_to_deg, _step_speeds_kmh
 
 
-class ContextEncoder(nn.Module):
-    RAW_CTX_DIM = 512
+@dataclass(frozen=True)
+class BatchFields:
+   
+    bt_obs: Any
+    bt_pred: Any
+    bt_obs_rel: Any
+    bt_pred_rel: Any
+    non_linear_ped: Any
+    mask: Any
+    seq_start_end: Any
+    bt_extra_obs: Any
+    bt_extra_pred: Any
+    bt_extra_obs_rel: Any
+    bt_extra_pred_rel: Any
+    era5_obs: Any
+    era5_pred: Any
+    env_features: Any
+    reserved: Any
+    storm_info: Any
 
-    def __init__(self, obs_len: int = 8, unet_in_ch: int = 13, d_cond: int = 256):
+    @classmethod
+    def from_list(cls, batch_list: List[Any]) -> "BatchFields":
+        return cls(*batch_list)
+
+
+class ContextEncoder(nn.Module):
+  
+    FUSED_MODALITY_DIM = 512 
+
+    def __init__(self, obs_len: int = 8, era5_in_channels: int = 13, d_cond: int = 256):
         super().__init__()
         self.obs_len = obs_len
         self.d_cond = d_cond
 
-        self.spatial_enc = FNO3DEncoder(
-            in_channel=unet_in_ch,
+        self.era5_encoder = FNO3DEncoder(
+            in_channel=era5_in_channels,
             out_channel=1,
             d_model=32,
             n_layers=4,
@@ -32,114 +60,158 @@ class ContextEncoder(nn.Module):
             spatial_down=32,
             dropout=0.05,
         )
-        self.bottleneck_pool = nn.AdaptiveAvgPool3D((None, 1, 1))
-        self.bottleneck_proj = nn.Linear(128, 128)
-        self.decoder_proj = nn.Linear(1, 16)
-        self.enc_1d = DataEncoder1D(
-            in_1d=4,
-            feat_era5_dim=128,
-            mlp_h=64,
-            lstm_hidden=128,
-            lstm_layers=3,
+       
+        self.era5_bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        self.era5_bottleneck_proj = nn.Linear(128, 128)
+        self.era5_summary_proj = nn.Linear(1, 16)
+
+       
+        self.bt_era5_encoder = BestTrackMambaEncoder(
+            bt_feature_dim=4,
+            era5_bottleneck_dim=128,
+            hidden_dim=64,
+            output_dim=128,
+            mamba_layers=3,
             dropout=0.1,
             d_state=16,
         )
-        self.env_enc = Env_net(obs_len=obs_len, d_model=32)
-        self.ctx_fc1 = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
-        self.ctx_ln = nn.LayerNorm(self.RAW_CTX_DIM)
-        self.ctx_drop = nn.Dropout(0.1)
-        self.ctx_fc2 = nn.Linear(self.RAW_CTX_DIM, d_cond)
-        self.ctx_ln2 = nn.LayerNorm(d_cond)
 
-        self.vel_obs_enc = nn.Sequential(
+
+        self.env_encoder = Env_net(obs_len=obs_len, d_model=32)
+
+
+        self.fuse_modalities = nn.Linear(128 + 32 + 16, self.FUSED_MODALITY_DIM)
+        self.fuse_modalities_norm = nn.LayerNorm(self.FUSED_MODALITY_DIM)
+        self.fuse_modalities_drop = nn.Dropout(0.1)
+        self.project_to_context = nn.Linear(self.FUSED_MODALITY_DIM, d_cond)
+        self.project_to_context_norm = nn.LayerNorm(d_cond)
+
+        self.kinematic_sequence_encoder = nn.Sequential(
             nn.Linear(obs_len * 7, 256),
             nn.GELU(),
             nn.LayerNorm(256),
             nn.Linear(256, d_cond // 2),
             nn.GELU(),
         )
-        self.hard_embed = nn.Sequential(
+       
+        self.difficulty_score_encoder = nn.Sequential(
             nn.Linear(1, d_cond // 4), nn.GELU(), nn.Linear(d_cond // 4, d_cond // 4)
         )
-        self.fuse = nn.Sequential(
+        self.final_fuse = nn.Sequential(
             nn.Linear(d_cond + d_cond // 2 + d_cond // 4, d_cond), nn.LayerNorm(d_cond), nn.GELU()
         )
 
-    def _encode_raw(self, batch_list) -> torch.Tensor:
+    def _encode_modalities(self, batch: BatchFields) -> torch.Tensor:
 
-        obs_traj = batch_list[0]
-        obs_Me = batch_list[7]
-        image_obs = batch_list[11]
-        env_data = batch_list[13]
-        if image_obs.dim() == 4:
-            image_obs = image_obs.unsqueeze(2)
-        if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
-            image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
 
-        e_era5_bot, e_era5_dec = self.spatial_enc.encode(image_obs)
-        T_obs = obs_traj.shape[0]
-        e_era5_s = self.bottleneck_pool(e_era5_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
-        e_era5_s = self.bottleneck_proj(e_era5_s)
-        if e_era5_s.shape[1] != T_obs:
-            e_era5_s = F.interpolate(
-                e_era5_s.permute(0, 2, 1), size=T_obs, mode="linear", align_corners=False
+        era5_patch = batch.era5_obs
+        if era5_patch.dim() == 4:
+            era5_patch = era5_patch.unsqueeze(2)
+        if era5_patch.shape[1] == 1 and self.era5_encoder.in_channel != 1:
+            era5_patch = era5_patch.expand(-1, self.era5_encoder.in_channel, -1, -1, -1)
+
+        era5_bottleneck_full, era5_decoder_summary = self.era5_encoder.encode(era5_patch)
+        n_obs_steps = batch.bt_obs.shape[0]
+
+        era5_bottleneck = (
+            self.era5_bottleneck_pool(era5_bottleneck_full).squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        )
+        era5_bottleneck = self.era5_bottleneck_proj(era5_bottleneck)
+        if era5_bottleneck.shape[1] != n_obs_steps:
+            era5_bottleneck = F.interpolate(
+                era5_bottleneck.permute(0, 2, 1),
+                size=n_obs_steps,
+                mode="linear",
+                align_corners=False,
             ).permute(0, 2, 1)
 
-        e_era5_dec_t = e_era5_dec.squeeze(1).squeeze(-1).squeeze(-1)
-        t_w = torch.softmax(
-            torch.arange(e_era5_dec_t.shape[1], dtype=torch.float, device=e_era5_dec_t.device) * 0.5,
+
+        era5_decoder_seq = era5_decoder_summary.squeeze(1).squeeze(-1).squeeze(-1)
+        recency_weights = torch.softmax(
+            torch.arange(era5_decoder_seq.shape[1], dtype=torch.float, device=era5_decoder_seq.device)
+            * 0.5,
             dim=0,
         )
-        f_sp = self.decoder_proj((e_era5_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
+        era5_summary = self.era5_summary_proj(
+            (era5_decoder_seq * recency_weights.unsqueeze(0)).sum(1, keepdim=True)
+        )
 
-        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
-        h_t = self.enc_1d(obs_in, e_era5_s)
-        e_env, _, _ = self.env_enc(env_data, image_obs)
-        return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))))
+        bt_full = torch.cat([batch.bt_obs, batch.bt_extra_obs], dim=2).permute(1, 0, 2)
+        h_n = self.bt_era5_encoder(bt_full, era5_bottleneck)
 
-    def _kinematic_feat(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        B = obs_traj.shape[1]
-        T_obs = obs_traj.shape[0]
-        if T_obs >= 2:
-            traj_deg = _norm_to_deg(obs_traj)
-            vel_norm = obs_traj[1:] - obs_traj[:-1]
-            speed = _step_speeds_kmh(traj_deg)
-            speed_n = (speed / 20.0).clamp(-3.0, 3.0)
-            heading = torch.atan2(vel_norm[:, :, 1], vel_norm[:, :, 0])
-            if T_obs >= 3:
-                dspd = speed[1:] - speed[:-1]
-                accel = torch.cat([obs_traj.new_zeros(1, B), (dspd / 10.0).clamp(-3.0, 3.0)], 0)
-                dh = torch.cat([obs_traj.new_zeros(1, B), heading[1:] - heading[:-1]], 0)
-                turn_rate = torch.atan2(torch.sin(dh), torch.cos(dh)) / math.pi
+        # Environmental branch.
+        e_env, _, _ = self.env_encoder(batch.env_features, era5_patch)
+
+        c_global_raw = self.fuse_modalities(torch.cat([h_n, e_env, era5_summary], dim=-1))
+        return F.gelu(self.fuse_modalities_norm(c_global_raw))
+
+    def _encode_kinematic_sequence(self, bt_position_obs: torch.Tensor) -> torch.Tensor:
+    
+        batch_size = bt_position_obs.shape[1]
+        n_obs_steps = bt_position_obs.shape[0]
+
+        if n_obs_steps >= 2:
+            position_deg = _norm_to_deg(bt_position_obs)
+            step_displacement = bt_position_obs[1:] - bt_position_obs[:-1]
+            speed = _step_speeds_kmh(position_deg)
+            speed_norm = (speed / 20.0).clamp(-3.0, 3.0)
+            heading = torch.atan2(step_displacement[:, :, 1], step_displacement[:, :, 0])
+
+            if n_obs_steps >= 3:
+                speed_delta = speed[1:] - speed[:-1]
+                acceleration = torch.cat(
+                    [bt_position_obs.new_zeros(1, batch_size), (speed_delta / 10.0).clamp(-3.0, 3.0)], 0
+                )
+                heading_delta = torch.cat(
+                    [bt_position_obs.new_zeros(1, batch_size), heading[1:] - heading[:-1]], 0
+                )
+                turn_rate = torch.atan2(torch.sin(heading_delta), torch.cos(heading_delta)) / math.pi
             else:
-                accel = obs_traj.new_zeros(T_obs - 1, B)
-                turn_rate = obs_traj.new_zeros(T_obs - 1, B)
-            kine = torch.stack(
+                acceleration = bt_position_obs.new_zeros(n_obs_steps - 1, batch_size)
+                turn_rate = bt_position_obs.new_zeros(n_obs_steps - 1, batch_size)
+
+            kinematic_feature = torch.stack(
                 [
-                    vel_norm[:, :, 0],
-                    vel_norm[:, :, 1],
-                    speed_n,
+                    step_displacement[:, :, 0],
+                    step_displacement[:, :, 1],
+                    speed_norm,
                     heading.sin(),
                     heading.cos(),
-                    accel,
+                    acceleration,
                     turn_rate,
                 ],
                 dim=-1,
             )
         else:
-            kine = obs_traj.new_zeros(self.obs_len, B, 7)
+            kinematic_feature = bt_position_obs.new_zeros(self.obs_len, batch_size, 7)
 
-        if kine.shape[0] < self.obs_len:
-            kine = torch.cat([obs_traj.new_zeros(self.obs_len - kine.shape[0], B, 7), kine], 0)
+        if kinematic_feature.shape[0] < self.obs_len:
+            pad_len = self.obs_len - kinematic_feature.shape[0]
+            kinematic_feature = torch.cat(
+                [bt_position_obs.new_zeros(pad_len, batch_size, 7), kinematic_feature], 0
+            )
         else:
-            kine = kine[-self.obs_len :]
-        return self.vel_obs_enc(kine.permute(1, 0, 2).reshape(B, -1))
+            kinematic_feature = kinematic_feature[-self.obs_len :]
+
+        return self.kinematic_sequence_encoder(
+            kinematic_feature.permute(1, 0, 2).reshape(batch_size, -1)
+        )
 
     def forward(self, batch_list, hard_score: Optional[torch.Tensor] = None) -> torch.Tensor:
-        raw = self._encode_raw(batch_list)
-        ctx = self.ctx_ln2(self.ctx_fc2(self.ctx_drop(raw)))
-        kfeat = self._kinematic_feat(batch_list[0][:, :, :2])
+
+        batch = BatchFields.from_list(batch_list)
+
+        c_global = self._encode_modalities(batch)
+        c_global = self.project_to_context_norm(
+            self.project_to_context(self.fuse_modalities_drop(c_global))
+        )
+
+        kinematic_feature = self._encode_kinematic_sequence(batch.bt_obs[:, :, :2])
+
         if hard_score is None:
-            hard_score = torch.zeros(ctx.shape[0], device=ctx.device)
-        hfeat = self.hard_embed(hard_score.unsqueeze(1).to(ctx.dtype))
-        return self.fuse(torch.cat([ctx, kfeat, hfeat], dim=-1))
+            hard_score = torch.zeros(c_global.shape[0], device=c_global.device)
+        difficulty_embedding = self.difficulty_score_encoder(
+            hard_score.unsqueeze(1).to(c_global.dtype)
+        )
+
+        return self.final_fuse(torch.cat([c_global, kinematic_feature, difficulty_embedding], dim=-1))
