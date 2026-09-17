@@ -29,7 +29,6 @@ def get_args():
     p.add_argument("--num_dec_layers", default=4, type=int)
     p.add_argument("--dim_ff", default=512, type=int)
     p.add_argument("--dropout", default=0.1, type=float)
-    p.add_argument("--unet_in_ch", default=13, type=int)
     p.add_argument("--sigma_min", default=0.06, type=float)
     p.add_argument("--sigma_max", default=0.15, type=float)
     p.add_argument("--sigma_decay_end", default=100, type=int)
@@ -98,39 +97,5 @@ def get_args():
     p.add_argument("--no_test", dest="test_at_end", action="store_false")
 
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--disable_l_heading",
-        action="store_true",
-        default=False,
-        help="Ablation: disable L_heading_ms",
-    )
-    p.add_argument(
-        "--disable_l_calib",
-        action="store_true",
-        default=False,
-        help="Ablation: disable L_calib ",
-    )
-    p.add_argument(
-        "--disable_l_reg",
-        action="store_true",
-        default=False,
-        help="Ablation: disable L_reg ",
-    )
-    p.add_argument(
-        "--disable_aug_c",
-        action="store_true",
-        default=False,
-        help="Ablation: disable AUG-C recurvature",
-    )
-    p.add_argument(
-        "--disable_learned_weights",
-        action="store_true",
-        default=False,
-    )
-    p.add_argument(
-        "--disable_hard_reg",
-        action="store_true",
-        default=False,
-    )
-    p.add_argument("--ablation_name", type=str, default="")
+
     return p.parse_args()
