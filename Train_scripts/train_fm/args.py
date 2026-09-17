@@ -4,7 +4,7 @@ import argparse
 def get_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    p.add_argument("--dataset_root", default="TCND_vn")
+    p.add_argument("--dataset_root", default=" ")
     p.add_argument("--obs_len", default=8, type=int)
     p.add_argument("--pred_len", default=12, type=int)
     p.add_argument("--num_workers", default=2, type=int)
