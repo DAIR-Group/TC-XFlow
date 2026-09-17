@@ -97,5 +97,4 @@ def get_args():
     p.add_argument("--no_test", dest="test_at_end", action="store_false")
 
     p.add_argument("--seed", type=int, default=42)
-
     return p.parse_args()
