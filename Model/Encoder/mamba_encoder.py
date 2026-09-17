@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import math
@@ -7,18 +8,17 @@ import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
-
-    def __init__(self, d: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
         return x / norm * self.weight
 
 
-def selective_scan_parallel(
+def selective_scan(
     u: torch.Tensor,
     delta: torch.Tensor,
     A: torch.Tensor,
@@ -26,24 +26,25 @@ def selective_scan_parallel(
     C: torch.Tensor,
     D: torch.Tensor,
 ) -> torch.Tensor:
-    B_size, T, d_inner = u.shape
+
+    batch_size, seq_len, d_inner = u.shape
     d_state = A.shape[1]
     device = u.device
 
     delta_clamped = delta.clamp(-10.0, 1.0)
 
-    dA = torch.exp(torch.einsum("bti,is->btis", delta_clamped, A))
-    dB_u = torch.einsum("bti,bts->btis", delta_clamped, B) * u.unsqueeze(-1)
+    discretized_A = torch.exp(torch.einsum("bti,is->btis", delta_clamped, A))
+    discretized_Bu = torch.einsum("bti,bts->btis", delta_clamped, B) * u.unsqueeze(-1)
 
-    h = torch.zeros(B_size, d_inner, d_state, device=device)
-    ys = []
-    for t in range(T):
-        h = dA[:, t] * h + dB_u[:, t]
-        y = torch.einsum("bis,bs->bi", h, C[:, t])
-        ys.append(y)
+    hidden_state = torch.zeros(batch_size, d_inner, d_state, device=device)
+    outputs = []
+    for t in range(seq_len):
+        hidden_state = discretized_A[:, t] * hidden_state + discretized_Bu[:, t]
+        y_t = torch.einsum("bis,bs->bi", hidden_state, C[:, t])
+        outputs.append(y_t)
 
-    out = torch.stack(ys, dim=1)
-    return out + u * D.unsqueeze(0).unsqueeze(0)
+    scan_output = torch.stack(outputs, dim=1)
+    return scan_output + u * D.unsqueeze(0).unsqueeze(0)
 
 
 class MambaBlock(nn.Module):
@@ -69,7 +70,7 @@ class MambaBlock(nn.Module):
 
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
 
-        self.conv1d = nn.Conv1d(
+        self.depthwise_conv = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
             kernel_size=d_conv,
@@ -78,20 +79,20 @@ class MambaBlock(nn.Module):
             bias=True,
         )
 
-        self.x_proj = nn.Linear(self.d_inner, dt_rank + 2 * d_state, bias=False)
+        self.state_proj = nn.Linear(self.d_inner, dt_rank + 2 * d_state, bias=False)
         self.dt_proj = nn.Linear(dt_rank, self.d_inner, bias=True)
 
         dt_init_std = dt_rank**-0.5
         nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        dt = torch.exp(
+        dt_init = torch.exp(
             torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         )
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        inv_dt = dt_init + torch.log(-torch.expm1(-dt_init))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
 
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
+        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A_init))
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
@@ -103,26 +104,26 @@ class MambaBlock(nn.Module):
         residual = x
         x = self.norm(x)
 
-        B_sz, T, _ = x.shape
+        seq_len = x.shape[1]
 
-        xz = self.in_proj(x)
-        x_s = xz[:, :, : self.d_inner]
-        z = xz[:, :, self.d_inner :]
+        gate_and_state = self.in_proj(x)
+        x_state = gate_and_state[:, :, : self.d_inner]
+        gate = gate_and_state[:, :, self.d_inner :]
 
-        x_conv_out = self.conv1d(x_s.permute(0, 2, 1))
-        x_conv = F.silu(x_conv_out[:, :, :T]).permute(0, 2, 1)
+        x_conv_out = self.depthwise_conv(x_state.permute(0, 2, 1))
+        x_conv = F.silu(x_conv_out[:, :, :seq_len]).permute(0, 2, 1)
 
-        dt_rank = self.x_proj.out_features - 2 * self.d_state
-        x_dbc = self.x_proj(x_conv)
-        dt_raw = x_dbc[:, :, :dt_rank]
-        B_ssm = x_dbc[:, :, dt_rank : dt_rank + self.d_state]
-        C_ssm = x_dbc[:, :, dt_rank + self.d_state :]
+        dt_rank = self.state_proj.out_features - 2 * self.d_state
+        state_params = self.state_proj(x_conv)
+        dt_raw = state_params[:, :, :dt_rank]
+        B_ssm = state_params[:, :, dt_rank : dt_rank + self.d_state]
+        C_ssm = state_params[:, :, dt_rank + self.d_state :]
 
         delta = F.softplus(self.dt_proj(dt_raw))
         A = -torch.exp(self.A_log.float())
 
-        y = selective_scan_parallel(x_conv, delta, A, B_ssm, C_ssm, self.D)
-        y = y * F.silu(z)
+        y = selective_scan(x_conv, delta, A, B_ssm, C_ssm, self.D)
+        y = y * F.silu(gate)
         y = self.out_proj(y)
 
         return self.drop(y) + residual
@@ -157,53 +158,61 @@ class MambaEncoder(nn.Module):
         for block in self.blocks:
             h = block(h)
         if self.pool == "last":
-            h_out = h[:, -1, :]
+            pooled = h[:, -1, :]
         elif self.pool == "mean":
-            h_out = h.mean(dim=1)
+            pooled = h.mean(dim=1)
         else:
-            h_out = h.max(dim=1).values
-        return self.out_proj(h_out)
+            pooled = h.max(dim=1).values
+        return self.out_proj(pooled)
 
 
-class DataEncoder1D_Mamba(nn.Module):
+class BestTrackMambaEncoder(nn.Module):
 
     def __init__(
         self,
-        in_1d: int = 4,
-        feat_3d_dim: int = 128,
-        mlp_h: int = 64,
-        lstm_hidden: int = 128,
-        lstm_layers: int = 3,
+        bt_feature_dim: int = 4,
+        era5_bottleneck_dim: int = 128,
+        hidden_dim: int = 64,
+        output_dim: int = 128,
+        mamba_layers: int = 3,
         dropout: float = 0.1,
         d_state: int = 16,
     ):
         super().__init__()
-        self.lstm_hidden = lstm_hidden
-        self.feat_3d_dim = feat_3d_dim
+        self.output_dim = output_dim
+        self.era5_bottleneck_dim = era5_bottleneck_dim
 
-        self.mlp_1d = nn.Sequential(nn.Linear(in_1d, mlp_h), nn.LayerNorm(mlp_h), nn.GELU())
-        self.mlp_fusion = nn.Sequential(
-            nn.Linear(feat_3d_dim + mlp_h, mlp_h * 2), nn.LayerNorm(mlp_h * 2), nn.GELU()
+        self.bt_proj = nn.Sequential(
+            nn.Linear(bt_feature_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()
+        )
+        self.fuse_bt_era5 = nn.Sequential(
+            nn.Linear(era5_bottleneck_dim + hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
         )
         self.mamba = MambaEncoder(
-            input_dim=mlp_h * 2,
-            hidden_dim=lstm_hidden,
-            d_model=lstm_hidden,
-            n_layers=lstm_layers,
+            input_dim=hidden_dim * 2,
+            hidden_dim=output_dim,
+            d_model=output_dim,
+            n_layers=mamba_layers,
             d_state=d_state,
             dropout=dropout,
             pool="last",
         )
 
-    def forward(self, obs_in: torch.Tensor, feat_3d: torch.Tensor) -> torch.Tensor:
-        T = obs_in.shape[1]
-        T_bot = feat_3d.shape[1]
+    def forward(self, bt_and_meta_obs: torch.Tensor, era5_bottleneck: torch.Tensor) -> torch.Tensor:
 
-        if T_bot != T:
-            feat_3d = F.interpolate(
-                feat_3d.permute(0, 2, 1), size=T, mode="linear", align_corners=False
+        n_obs_steps = bt_and_meta_obs.shape[1]
+        n_bottleneck_steps = era5_bottleneck.shape[1]
+
+        if n_bottleneck_steps != n_obs_steps:
+            era5_bottleneck = F.interpolate(
+                era5_bottleneck.permute(0, 2, 1),
+                size=n_obs_steps,
+                mode="linear",
+                align_corners=False,
             ).permute(0, 2, 1)
 
-        e_1d = self.mlp_1d(obs_in)
-        e_en = self.mlp_fusion(torch.cat([feat_3d, e_1d], dim=-1))
-        return self.mamba(e_en)
+        bt_embedded = self.bt_proj(bt_and_meta_obs)
+        fused = self.fuse_bt_era5(torch.cat([era5_bottleneck, bt_embedded], dim=-1))
+        return self.mamba(fused)
