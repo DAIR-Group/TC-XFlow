@@ -1,89 +1,94 @@
+
 from __future__ import annotations
 
 import math
 
 import torch
 
+_SHIFT_UPPER = 0.25
+_SPEED_SCALE_UPPER = 0.45
+_RECURVATURE_UPPER = 0.65
+_NO_AUGMENT_UPPER = 0.90
 
 def augment_batch(batch_list, disable_c: bool = False) -> list:
-    bl = list(batch_list)
-    if not torch.is_tensor(bl[0]):
-        return bl
+    batch = list(batch_list)
+    if not torch.is_tensor(batch[0]):
+        return batch
 
-    obs = bl[0]
-    device = obs.device
-    anchor = obs[-1:, :, :2].detach()
-    r = torch.rand(1).item()
+    obs_position = batch[0]
+    device = obs_position.device
+    anchor = obs_position[-1:, :, :2].detach()
+    branch = torch.rand(1).item()
 
-    if r < 0.25:
-        _augment_shift(bl, obs, device)
-    elif r < 0.45:
-        _augment_speed_scale(bl, obs, anchor)
-    elif r < 0.65:
+    if branch < _SHIFT_UPPER:
+        _augment_positional_shift(batch, obs_position, device)
+    elif branch < _SPEED_SCALE_UPPER:
+        _augment_speed_rescale(batch, obs_position, anchor)
+    elif branch < _RECURVATURE_UPPER:
         if not disable_c:
-            _augment_recurvature(bl, obs, anchor, device)
-    elif r < 0.90:
-        pass
+            _augment_recurvature_rotation(batch, obs_position, anchor, device)
+    elif branch < _NO_AUGMENT_UPPER:
+        pass  # unmodified batch
     else:
-        _augment_noise(bl, obs)
+        _augment_isotropic_noise(batch, obs_position)
 
-    return bl
+    return batch
 
 
-def _augment_shift(bl, obs, device):
+def _augment_positional_shift(batch, obs_position, device):
+   
     shift = (torch.rand(2, device=device) - 0.5) * 0.018
-    bl[0] = obs + shift.view(1, 1, 2)
-    if torch.is_tensor(bl[1]):
-        bl[1] = bl[1] + shift.view(1, 1, 2)
+    batch[0] = obs_position + shift.view(1, 1, 2)
+    if torch.is_tensor(batch[1]):
+        batch[1] = batch[1] + shift.view(1, 1, 2)
 
 
-def _augment_speed_scale(bl, obs, anchor):
+def _augment_speed_rescale(batch, obs_position, anchor):
+  
+    scale = 0.70 + 0.70 * torch.rand(1, device=obs_position.device).item()
+    obs_rescaled = obs_position.clone()
+    obs_rescaled[..., :2] = anchor + (obs_position[..., :2] - anchor) * scale
+    batch[0] = obs_rescaled
+    if torch.is_tensor(batch[1]):
+        batch[1] = anchor + (batch[1] - anchor) * scale
 
-    scale = 0.70 + 0.70 * torch.rand(1, device=obs.device).item()
-    obs_c = obs.clone()
-    obs_c[..., :2] = anchor + (obs[..., :2] - anchor) * scale
-    bl[0] = obs_c
-    if torch.is_tensor(bl[1]):
-        bl[1] = anchor + (bl[1] - anchor) * scale
-
-
-def _augment_recurvature(bl, obs, anchor, device):
-
-    T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-    if T_pred < 4:
+def _augment_recurvature_rotation(batch, obs_position, anchor, device):
+   
+    n_pred_steps = batch[1].shape[0] if torch.is_tensor(batch[1]) else 0
+    if n_pred_steps < 4:
         return
 
-    gt = bl[1].clone()
-    max_deg = (torch.rand(1).item() - 0.5) * 40.0
-    max_rad = max_deg * math.pi / 180.0
-    pts = torch.cat([anchor, gt], 0)
-    disp = pts[1:] - pts[:-1]
+    ground_truth = batch[1].clone()
+    max_rotation_deg = (torch.rand(1).item() - 0.5) * 40.0
+    max_rotation_rad = max_rotation_deg * math.pi / 180.0
+    points = torch.cat([anchor, ground_truth], 0)
+    displacement = points[1:] - points[:-1]
 
-    for t in range(T_pred):
-        progress = (t / max(T_pred - 1, 1)) ** 1.5
-        a = max_rad * progress
-        c, s = math.cos(a), math.sin(a)
-        rot = torch.tensor([[c, -s], [s, c]], dtype=gt.dtype, device=device)
-        disp[t] = (rot @ disp[t].unsqueeze(-1)).squeeze(-1)
+    for h in range(n_pred_steps):
+        progress = (h / max(n_pred_steps - 1, 1)) ** 1.5
+        angle = max_rotation_rad * progress
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        rotation = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], dtype=ground_truth.dtype, device=device)
+        displacement[h] = (rotation @ displacement[h].unsqueeze(-1)).squeeze(-1)
 
-    gt_new = gt.clone()
-    gt_new[0] = anchor[0] + disp[0]
-    for t in range(1, T_pred):
-        gt_new[t] = gt_new[t - 1] + disp[t]
-    bl[1] = gt_new
+    rotated_ground_truth = ground_truth.clone()
+    rotated_ground_truth[0] = anchor[0] + displacement[0]
+    for h in range(1, n_pred_steps):
+        rotated_ground_truth[h] = rotated_ground_truth[h - 1] + displacement[h]
+    batch[1] = rotated_ground_truth
 
-    T_obs = obs.shape[0]
-    obs_aug = obs.clone()
-    cp, sp = math.cos(max_rad * 0.3), math.sin(max_rad * 0.3)
-    rp = torch.tensor([[cp, -sp], [sp, cp]], dtype=obs.dtype, device=device)
-    for t_obs in range(max(1, T_obs - 3), T_obs):
-        d = obs_aug[t_obs, :, :2] - obs_aug[t_obs - 1, :, :2]
-        obs_aug[t_obs, :, :2] = obs_aug[t_obs - 1, :, :2] + (rp @ d.unsqueeze(-1)).squeeze(-1)
-    bl[0] = obs_aug
+    n_obs_steps = obs_position.shape[0]
+    obs_rotated = obs_position.clone()
+    partial_angle = max_rotation_rad * 0.3
+    cos_p, sin_p = math.cos(partial_angle), math.sin(partial_angle)
+    partial_rotation = torch.tensor([[cos_p, -sin_p], [sin_p, cos_p]], dtype=obs_position.dtype, device=device)
+    for t in range(max(1, n_obs_steps - 3), n_obs_steps):
+        step_disp = obs_rotated[t, :, :2] - obs_rotated[t - 1, :, :2]
+        obs_rotated[t, :, :2] = obs_rotated[t - 1, :, :2] + (partial_rotation @ step_disp.unsqueeze(-1)).squeeze(-1)
+    batch[0] = obs_rotated
 
+def _augment_isotropic_noise(batch, obs_position):
 
-def _augment_noise(bl, obs):
-
-    obs_new = obs.clone()
-    obs_new[..., :2] = obs[..., :2] + torch.randn_like(obs[..., :2]) * 0.003
-    bl[0] = obs_new
+    obs_noisy = obs_position.clone()
+    obs_noisy[..., :2] = obs_position[..., :2] + torch.randn_like(obs_position[..., :2]) * 0.003
+    batch[0] = obs_noisy
