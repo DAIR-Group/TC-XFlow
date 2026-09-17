@@ -32,12 +32,12 @@ class ContextEncoder(nn.Module):
             spatial_down=32,
             dropout=0.05,
         )
-        self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        self.bottleneck_pool = nn.AdaptiveAvgPool3D((None, 1, 1))
         self.bottleneck_proj = nn.Linear(128, 128)
         self.decoder_proj = nn.Linear(1, 16)
         self.enc_1d = DataEncoder1D(
             in_1d=4,
-            feat_3d_dim=128,
+            feat_era5_dim=128,
             mlp_h=64,
             lstm_hidden=128,
             lstm_layers=3,
@@ -76,24 +76,24 @@ class ContextEncoder(nn.Module):
         if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
             image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
 
-        e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
+        e_era5_bot, e_era5_dec = self.spatial_enc.encode(image_obs)
         T_obs = obs_traj.shape[0]
-        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
-        e_3d_s = self.bottleneck_proj(e_3d_s)
-        if e_3d_s.shape[1] != T_obs:
-            e_3d_s = F.interpolate(
-                e_3d_s.permute(0, 2, 1), size=T_obs, mode="linear", align_corners=False
+        e_era5_s = self.bottleneck_pool(e_era5_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        e_era5_s = self.bottleneck_proj(e_era5_s)
+        if e_era5_s.shape[1] != T_obs:
+            e_era5_s = F.interpolate(
+                e_era5_s.permute(0, 2, 1), size=T_obs, mode="linear", align_corners=False
             ).permute(0, 2, 1)
 
-        e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
+        e_era5_dec_t = e_era5_dec.squeeze(1).squeeze(-1).squeeze(-1)
         t_w = torch.softmax(
-            torch.arange(e_3d_dec_t.shape[1], dtype=torch.float, device=e_3d_dec_t.device) * 0.5,
+            torch.arange(e_era5_dec_t.shape[1], dtype=torch.float, device=e_era5_dec_t.device) * 0.5,
             dim=0,
         )
-        f_sp = self.decoder_proj((e_3d_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
+        f_sp = self.decoder_proj((e_era5_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
 
         obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
-        h_t = self.enc_1d(obs_in, e_3d_s)
+        h_t = self.enc_1d(obs_in, e_era5_s)
         e_env, _, _ = self.env_enc(env_data, image_obs)
         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))))
 
